@@ -153,7 +153,9 @@ class App:
         self.engine = core.Engine(log=self.log)
         self.stop_event = threading.Event()
         self.thread = threading.Thread(target=self.engine.loop, args=(self.stop_event,), daemon=True)
-        self.v = self.e = None
+        self.v_all = self.v = self.e = None
+        self.prov = None
+        self.agent_btns = {}
         self.sig = None
         self.loaded = 0
         self.tab = "Timeline"
@@ -172,10 +174,12 @@ class App:
         head = tk.Frame(self.root, bg=BG)
         head.pack(fill="x")
         label(head, "Harvester", font=TITLE).pack(side="left")
-        self.pill = tk.Label(head, bg=BG, font=("Segoe UI Semibold", 9), padx=8, pady=1)
-        self.pill.pack(side="left", padx=10)
+        self.agent_bar = tk.Frame(head, bg=BG)
+        self.agent_bar.pack(side="left", padx=(14, 0))
         self.checked = label(head, fg=MUTED)
         self.checked.pack(side="right")
+        self.pill = tk.Label(head, bg=BG, font=("Segoe UI Semibold", 9), padx=8, pady=1)
+        self.pill.pack(side="right", padx=10)
         self.reason = label(self.root, fg=MUTED, wraplength=WIDTH - 40)
         self.reason.pack(fill="x", pady=(2, 12))
 
@@ -298,8 +302,8 @@ class App:
     def build_queue(self):
         f = tk.Frame(self.body, bg=PANEL)
         self.queue_tv = self.tree(f, [("id", "#", 40, "e"), ("status", "status", 80, "w"), ("prio", "prio", 40, "e"),
-                                      ("folder", "folder", 110, "w"), ("prompt", "prompt", 320, "w"),
-                                      ("note", "note", 140, "w")])
+                                      ("agent", "agent", 56, "w"), ("folder", "folder", 100, "w"),
+                                      ("prompt", "prompt", 300, "w"), ("note", "note", 130, "w")])
         self.queue_tv.bind("<Double-1>", lambda _: self.open_selected(self.queue_tv))
         bar = tk.Frame(f, bg=PANEL)
         bar.pack(fill="x", pady=(8, 0))
@@ -334,17 +338,50 @@ class App:
     # Data
 
     def reload(self):
-        self.v = views.load()
+        self.v_all = views.load()
+        provs = self.v_all["providers"]
+        if self.prov not in provs:
+            self.prov = provs[0]
+        if list(self.agent_btns) != provs:
+            self.build_agents(provs)
+        self.v = views.select(self.v_all, self.prov)
         self.e = views.estimate(self.v)
         self.loaded = time.time()
         self.update_meters()
         self.update_estimates()
         self.draw_tab()
 
-    def mode(self):
+    def build_agents(self, provs):
+        for b in self.agent_btns.values():
+            b.destroy()
+        self.agent_btns = {}
+        for name in provs:
+            b = tk.Button(self.agent_bar, command=lambda n=name: self.set_agent(n), relief="flat", bd=0, padx=10,
+                          pady=3, font=SMALL, cursor="hand2", activebackground=TRACK, activeforeground=FG)
+            b.pack(side="left", padx=(0, 4))
+            self.agent_btns[name] = b
+        self.paint_agents()
+
+    def paint_agents(self):
+        for name, b in self.agent_btns.items():
+            mode = self.mode(name)
+            on = name == self.prov
+            b.config(text=f"{core.PROVIDERS[name].label} · {mode}", bg=TRACK if on else BG,
+                     fg=FG if on else MODE_COLOR.get(mode, MUTED))
+
+    def set_agent(self, name):
+        self.prov = name
+        self.sig = None
+        self.refresh_header()
+        self.reload()
+
+    def pstate(self, name=None):
+        return (self.engine.state.get("providers") or {}).get(name or self.prov) or {}
+
+    def mode(self, name=None):
         if core.path("paused").exists():
             return "paused"
-        return (self.engine.state.get("decision") or {}).get("mode", "starting")
+        return (self.pstate(name).get("decision") or {}).get("mode", "starting")
 
     def update_meters(self):
         e, v = self.e, self.v
@@ -483,7 +520,7 @@ class App:
             c.create_rectangle(X(a), mid - 8, X(e["Ts"]), mid + 8, outline=MODE_COLOR["burn"], dash=(3, 2),
                                tags="planned")
             self.tl_tip.bind("planned", f"planned burn {core.fmt_clock(a)}–{core.fmt_clock(e['Ts'])}")
-        for key, fill, text in (("eta_idle", "", "earliest harvest start, if you stop using Claude"),
+        for key, fill, text in (("eta_idle", "", f"earliest harvest start, if you stop using {e['label']}"),
                                 ("eta_pace", AMBER, "harvest starts at your pace")):
             t = e.get(key)
             if t and now < t < end:
@@ -652,7 +689,8 @@ class App:
                  + sorted((t for t in tasks if t["status"] == "done"), key=lambda t: -t.get("updated", 0)))
         self.refill(self.queue_tv, [
             (str(t["id"]), (t["id"], f"{views.MARK.get(t['status'], '')} {t['status']}", t["priority"] or "",
-                            Path(t["dir"]).name, views.short(t["prompt"], 120), views.short(t.get("note") or "", 60)),
+                            core.route(t), Path(t["dir"]).name, views.short(t["prompt"], 120),
+                            views.short(t.get("note") or "", 60)),
              t["status"]) for t in order])
 
     def selected_task(self, tv=None, by_tag=False):
@@ -686,7 +724,7 @@ class App:
         self.edit_selected(lambda tasks, t: t.update(priority=max(x["priority"] for x in tasks) + 1))
 
     def q_retry(self):
-        self.edit_selected(lambda tasks, t: t.update(status="queued", note="", session_id=None, runs=0))
+        self.edit_selected(lambda tasks, t: core.reset_task(t))
 
     def q_remove(self):
         tid = self.selected_task()
@@ -704,7 +742,7 @@ class App:
         txt = tk.Text(win, bg=PANEL, fg=FG, insertbackground=FG, relief="flat", font=MONO, wrap="word",
                       width=96, height=32, padx=10, pady=8)
         txt.pack(fill="both", expand=True)
-        meta = [f"#{t['id']} · {t['status']} · runs {t['runs']} · {t['dir']}"]
+        meta = [f"#{t['id']} · {t['status']} · runs {t['runs']} · {core.route(t)} · {t['dir']}"]
         meta += [f"{k}: {t[k]}" for k in ("model", "permission_mode", "tools", "note", "session_id") if t.get(k)]
         txt.insert("end", "\n".join(meta) + "\n\n" + t["prompt"])
         res = core.path("results") / f"{t['id']}.md"
@@ -774,16 +812,21 @@ class App:
             win.destroy()
         button(win, "Save", save).grid(row=len(fields), column=2, sticky="e", pady=(10, 0))
 
-    def refresh(self):
-        s = self.engine.state
+    def refresh_header(self):
+        s, ps = self.engine.state, self.pstate()
         mode = self.mode()
         self.pill.config(text=mode, fg=BG, bg=MODE_COLOR.get(mode, MUTED))
         self.pause_btn.config(text="Resume" if mode == "paused" else "Pause")
-        reason = "paused by you" if mode == "paused" else (s.get("decision") or {}).get("reason", "checking usage…")
-        if s.get("user_active") and mode != "paused":
+        reason = "paused by you" if mode == "paused" else (ps.get("decision") or {}).get("reason", "checking usage…")
+        if ps.get("user_active") and mode != "paused":
             reason += " · you're active"
-        self.reason.config(text=s.get("error") or reason, fg=RED if s.get("error") else MUTED)
-        updated = s.get("updated")
+        error = ps.get("error") or s.get("error")
+        self.reason.config(text=error or reason, fg=RED if error else MUTED)
+        self.paint_agents()
+        return s.get("updated")
+
+    def refresh(self):
+        updated = self.refresh_header()
         self.checked.config(text=f"checked {views.ago(time.time() - updated)} ago" if updated else "first check…")
         self.logbox.config(text="\n".join(self.logs))
         try:

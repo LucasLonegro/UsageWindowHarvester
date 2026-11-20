@@ -94,7 +94,7 @@ def when(ts):
 def task_line(t, width, s):
     prio = f"p{t['priority']}" if t["priority"] else ""
     left = f" {t['id']:>3} {prio:<3} "
-    folder = f"[{Path(t['dir']).name}]"
+    folder = f"[{Path(t['dir']).name}] {core.route(t)}"
     note = f"  ({short(t['note'], 40)})" if t.get("note") else ""
     room = max(20, width - 1 - len(left) - len(folder) - 2 - len(note))
     mark = s(MARK.get(t["status"], "?"), STATUS_COLOR.get(t["status"], ""))
@@ -110,9 +110,29 @@ def load(now=None):
     for t in tasks:
         if t["status"] == "running" and t.get("started"):
             runs.append({"task": t["id"], "run": t["runs"], "start": t["started"], "end": None,
-                         "status": "running"})
-    return {"now": now, "cfg": core.load_config(), "st": core.read_json(core.path("state.json"), {}),
-            "tasks": tasks, "runs": runs, "hist": core.read_jsonl("history.jsonl")}
+                         "status": "running", "p": core.route(t)})
+    hist = core.read_jsonl("history.jsonl")
+    for r in runs + hist:
+        r.setdefault("p", "claude")
+    st = core.read_json(core.path("state.json"), {})
+    provs = [n for n in core.PROVIDERS if n in (st.get("enabled") or [])]
+    return {"now": now, "cfg": core.load_config(), "st": st, "tasks": tasks, "runs": runs, "hist": hist,
+            "providers": provs or ["claude"]}
+
+
+def select(v, name):
+    """The view of one agent: its state, history and runs."""
+    st = v["st"]
+    ps = (st.get("providers") or {}).get(name)
+    if ps is None and name == "claude":
+        ps = {k: st[k] for k in ("usage", "decision", "user_active", "learned", "error") if k in st}
+    ps = dict(ps or {}, updated=st.get("updated"))
+    return dict(v, p=name, label=core.PROVIDERS[name].label, st=ps,
+                hist=[h for h in v["hist"] if h["p"] == name], runs=[r for r in v["runs"] if r["p"] == name])
+
+
+def agents(v, only=None):
+    return [select(v, p) for p in ([only] if only else v["providers"])]
 
 
 def harvested(v, since, e):
@@ -133,10 +153,12 @@ def estimate(v):
          "c_learned": bool(learned.get("window_weekly_pct")),
          "rate": learned.get("burn_pct_per_min") or cfg["burn_pct_per_min"],
          "rate_learned": bool(learned.get("burn_pct_per_min")),
-         "par": max(1, cfg["max_parallel"]), "margin": cfg["slack_margin_windows"]}
+         "par": max(1, cfg["max_parallel"]), "margin": cfg["slack_margin_windows"],
+         "label": v.get("label", "Claude Code"), "L": core.WINDOW_S}
     u = st.get("usage")
     if not u:
         return e
+    L = e["L"] = u.get("session_len") or core.WINDOW_S
     S, Ts, W, Tw = u["session_pct"], u["session_reset"], u["weekly_pct"], u["weekly_reset"]
     if not (Ts and Ts > now):
         S, Ts = 0.0, None
@@ -151,9 +173,9 @@ def estimate(v):
         fill = max(0.0, cap - S) / (rate * e["par"]) * 60
         tail = max(cfg["min_tail_minutes"] * 60, fill * cfg["tail_safety"])
         e.update(session_left=left, cap=cap, fill_s=fill, burn_at=Ts - tail)
-        elapsed = core.WINDOW_S - left
+        elapsed = L - left
         if elapsed >= 900:
-            e["session_proj"] = min(100.0, S / elapsed * core.WINDOW_S)
+            e["session_proj"] = min(100.0, S / elapsed * L)
     if not Tw:
         return e
 
@@ -163,7 +185,7 @@ def estimate(v):
     # The user's own pace: weekly use minus what backlog runs likely spent.
     pace = max(0.0, W - h["week_pct"]) / elapsed
     current = c * (100 - S) / 100 if Ts else 0.0
-    future = max(0.0, Tw - (Ts or now)) / core.WINDOW_S
+    future = max(0.0, Tw - (Ts or now)) / L
     slack = (current + c * future - (100 - W)) / c
     proj = min(100.0, W + pace * (Tw - now))
     e.update(week_start=start, week_left=Tw - now, even=min(100.0, elapsed / WEEK_S * 100),
@@ -177,8 +199,8 @@ def estimate(v):
         e["eta_idle"] = e["eta_pace"] = now
     else:
         # Spare sessions shrink one per 5h, and grow as you spend the week.
-        e["eta_idle"] = min(Tw, now + gap * core.WINDOW_S)
-        shrink = 1 / core.WINDOW_S - pace / c
+        e["eta_idle"] = min(Tw, now + gap * L)
+        shrink = 1 / L - pace / c
         eta = now + gap / shrink if shrink > 0 else None
         e["eta_pace"] = eta if eta and eta < Tw else None
     return e
@@ -198,13 +220,26 @@ def header(v, width, s):
     title = "Usage Harvester"
     pad = max(2, width - len(title) - len(app) - len(clock) - 5)
     lines = [s(title, "1") + " " * pad + s(app, code) + s("  ·  " + clock, "90")]
+    if st.get("error"):
+        lines.append(s("error: " + st["error"], "31"))
+    return lines
+
+
+def current_mode(pv):
+    return "paused" if core.path("paused").exists() else (pv["st"].get("decision") or {}).get("mode")
+
+
+def agent_line(pv, s):
+    st = pv["st"]
     d = st.get("decision") or {}
-    mode = "paused" if core.path("paused").exists() else d.get("mode")
+    mode = current_mode(pv)
+    line = s(pv["label"], "1")
     if mode:
         reason = d.get("reason", "") if mode == d.get("mode") else "paused by you"
         if st.get("user_active") and mode != "paused":
             reason += s(" · you're active", "34")
-        lines.append(s(f" {mode.upper()} ", "7;1;" + MODE_COLOR.get(mode, "37")) + "  " + reason)
+        line += "  " + s(f" {mode.upper()} ", "7;1;" + MODE_COLOR.get(mode, "37")) + "  " + reason
+    lines = [line]
     if st.get("error"):
         lines.append(s("error: " + st["error"], "31"))
     return lines
@@ -242,7 +277,7 @@ def meters(v, e, width, s):
             parts.append(f"▒ your pace → {e['session_proj']:.0f}%")
         parts.append(f"tasks fill to cap in {core.fmt_dur(e['fill_s'])}")
         window = f"{core.fmt_clock(max(e['burn_at'], v['now']))}–{core.fmt_clock(e['Ts'])}"
-        harvesting = (v["st"].get("decision") or {}).get("mode") in ("harvest", "burn")
+        harvesting = current_mode(v) in ("harvest", "burn")
         parts.append(f"burn window {window}" if harvesting else f"if harvesting, would burn {window}")
     else:
         bar = meter(bw, 0)
@@ -268,7 +303,7 @@ def estimate_rows(e):
         eta = ["now"]
     else:
         eta = [f"~{core.fmt_clock(e['eta_pace'])} at your pace" if e["eta_pace"] else "not before reset at your pace",
-               f"{core.fmt_clock(e['eta_idle'])} at the earliest, if you stop using Claude"]
+               f"{core.fmt_clock(e['eta_idle'])} at the earliest, if you stop using {e['label']}"]
     if e["unused"] >= 0.5:
         unused = [f"{e['unused']:.0f}% of week", f"≈ {e['unused_sessions']:.1f} sessions",
                   f"≈ {core.fmt_dur(e['unused_task_s'])} of task time", "(without the harvester)"]
@@ -376,7 +411,7 @@ def timeline(v, e, start, end, width, s, max_tasks=6, title="Timeline"):
 
     if now_c is not None and e.get("Ts"):
         paint(sess, now + step, min(e["Ts"], end - 1), "╌", "2;36")
-        mode_now = (v["st"].get("decision") or {}).get("mode")
+        mode_now = current_mode(v)
         if mode_now in ("harvest", "burn") and e.get("burn_at"):
             paint(mode, max(e["burn_at"], now + step), min(e["Ts"], end - 1), "░", "35")
     for key, ch in (("eta_idle", "◇"), ("eta_pace", "◆")):
@@ -429,29 +464,34 @@ def backlog_block(v, width, s, n=5):
     return lines
 
 
-def render_status(v, width, s):
-    e = estimate(v)
+def render_status(v, width, s, only=None):
     now = v["now"]
-    out = header(v, width, s) + [""] + meters(v, e, width, s) + [""]
-    est = estimates_block(e, width, s)
-    if est:
-        out += est + [""]
-    out += timeline(v, e, now - 8 * 3600, now + 4 * 3600, width, s, max_tasks=4, title="Last 8h") + [""]
+    out = header(v, width, s) + [""]
+    for pv in agents(v, only):
+        e = estimate(pv)
+        out += agent_line(pv, s) + meters(pv, e, width, s) + [""]
+        est = estimates_block(e, width, s)
+        if est:
+            out += est + [""]
+        out += timeline(pv, e, now - 8 * 3600, now + 4 * 3600, width, s, max_tasks=4, title="Last 8h") + [""]
     out += backlog_block(v, width, s)
-    out.append(s("more: hv gantt · hv week · hv runs · hv watch", "90"))
+    out.append(s("more: hv gantt · hv week · hv runs · hv watch · -p claude|codex for one agent", "90"))
     return "\n".join(out)
 
 
-def render_short(v, s):
-    e = estimate(v)
+def render_short(v, s, only=None):
+    parts = []
+    for pv in agents(v, only):
+        e = estimate(pv)
+        mode = current_mode(pv) or "?"
+        line = [pv["p"], s(mode.upper(), MODE_COLOR.get(mode, ""))]
+        if "S" in e:
+            line.append(f"session {e['S']:.0f}%" + (f" ↺{core.fmt_dur(e['session_left'])}" if e["Ts"] else ""))
+            line.append(f"week {e['W']:.0f}%" + (f" ↺{core.fmt_dur(e['week_left'])}" if e["Tw"] else ""))
+        if "slack" in e:
+            line.append(f"spare {e['slack']:+.1f}")
+        parts.append(" ".join(line))
     st = v["st"]
-    mode = "paused" if core.path("paused").exists() else (st.get("decision") or {}).get("mode", "?")
-    parts = [s(mode.upper(), MODE_COLOR.get(mode, ""))]
-    if "S" in e:
-        parts.append(f"session {e['S']:.0f}%" + (f" ↺{core.fmt_dur(e['session_left'])}" if e["Ts"] else ""))
-        parts.append(f"week {e['W']:.0f}%" + (f" ↺{core.fmt_dur(e['week_left'])}" if e["Tw"] else ""))
-    if "slack" in e:
-        parts.append(f"spare {e['slack']:+.1f}")
     counts = Counter(t["status"] for t in v["tasks"])
     parts.append(f"{counts['queued'] + counts['paused']} queued")
     if counts["running"]:
@@ -461,21 +501,29 @@ def render_short(v, s):
     return " · ".join(parts)
 
 
-def render_gantt(v, width, s, hours=24, ahead=6, week=False):
+def render_gantt(v, width, s, hours=24, ahead=6, week=False, only=None):
+    return "\n\n".join(gantt_one(pv, width, s, hours, ahead, week) for pv in agents(v, only))
+
+
+def gantt_one(v, width, s, hours, ahead, week):
     e = estimate(v)
     now = v["now"]
     if week and e.get("Tw"):
         start, end, title = e["Tw"] - WEEK_S, e["Tw"], "This week"
     else:
         start, end, title = now - hours * 3600, now + ahead * 3600, f"Last {hours:g}h"
-    return "\n".join(timeline(v, e, start, end, width, s, max_tasks=30, title=title))
+    return "\n".join([s(v["label"], "1")] + timeline(v, e, start, end, width, s, max_tasks=30, title=title))
 
 
-def render_week(v, width, s, rows=10):
+def render_week(v, width, s, rows=10, only=None):
+    return "\n\n".join(week_one(pv, width, s, rows) for pv in agents(v, only))
+
+
+def week_one(v, width, s, rows):
     e = estimate(v)
     Tw = e.get("Tw")
     if not Tw:
-        return "no weekly data yet"
+        return s(v["label"], "1") + "  no weekly data yet"
     now, start = v["now"], Tw - WEEK_S
     cols = max(20, width - 6)
     step = WEEK_S / cols
@@ -506,7 +554,7 @@ def render_week(v, width, s, rows=10):
             return SPARK[min(7, int((val - lo) / 10 * 8))]
         return None
 
-    lines = [s("Weekly usage", "1") + s(f"  resets {core.fmt_clock(Tw)} · {core.fmt_dur(Tw - now)} left", "90")]
+    lines = [s(f"{v['label']} · weekly usage", "1") + s(f"  resets {core.fmt_clock(Tw)} · {core.fmt_dur(Tw - now)} left", "90")]
     for r in range(rows - 1, -1, -1):
         lo = r * 100 / rows
         cells = []
@@ -548,16 +596,20 @@ def render_week(v, width, s, rows=10):
     return "\n".join(lines)
 
 
-def render_runs(v, width, s, limit=20):
+def render_runs(v, width, s, limit=20, only=None):
+    return "\n\n".join(runs_one(pv, width, s, limit) for pv in agents(v, only))
+
+
+def runs_one(v, width, s, limit):
     e = estimate(v)
     now = v["now"]
     prompts = {t["id"]: t["prompt"] for t in v["tasks"]}
     runs = sorted(v["runs"], key=lambda r: r["start"], reverse=True)
     if not runs:
-        return "no backlog runs yet"
+        return s(v["label"], "1") + "  no backlog runs yet"
     per_min = e["rate"] * e["c"] / 100
     head = f"{'task':>5} {'run':>3}  {'started':<9} {'length':>6}  {'status':<9} {'turns':>5} {'≈week':>6}  prompt"
-    lines = [s(head, "90")]
+    lines = [s(v["label"], "1"), s(head, "90")]
     for r in runs[:limit]:
         secs = (r["end"] or now) - r["start"]
         status = s(f"{MARK.get(r['status'], '?')} {r['status']:<7}", STATUS_COLOR.get(r["status"], ""))

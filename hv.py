@@ -1,6 +1,8 @@
 import argparse
 import json
 import os
+import re
+import shutil
 import subprocess
 import sys
 import time
@@ -13,13 +15,18 @@ FROZEN = getattr(sys, "frozen", False)
 HERE = Path(sys.executable).parent if FROZEN else Path(__file__).parent
 APP = HERE / ("Harvester.exe" if FROZEN else "app.pyw")
 STARTUP_LNK = Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs/Startup/Usage Harvester.lnk"
+SKILL_SRC = HERE / "skills" / "backlog" / "SKILL.md"
+SKILL_DIRS = {"claude": Path.home() / ".claude" / "skills" / "backlog",
+              "codex": Path.home() / ".agents" / "skills" / "backlog"}
+
+
 def cmd_status(a):
     s = views.make_style()
     v = views.load()
     if a.short:
-        print(views.render_short(v, s))
+        print(views.render_short(v, s, a.provider))
     else:
-        print(views.render_status(v, views.term_width(), s))
+        print(views.render_status(v, views.term_width(), s, a.provider))
 
 
 def cmd_watch(a):
@@ -29,7 +36,7 @@ def cmd_watch(a):
     sys.stdout.write(esc("?25l"))
     try:
         while True:
-            body = views.render_status(views.load(), views.term_width(), s)
+            body = views.render_status(views.load(), views.term_width(), s, a.provider)
             body += "\n" + s(f"refreshing every {a.interval}s · Ctrl+C to exit", "90")
             lines = [line + esc("K") for line in body.split("\n")]
             sys.stdout.write(esc("H") + "\n".join(lines) + esc("J"))
@@ -42,15 +49,16 @@ def cmd_watch(a):
 
 
 def cmd_gantt(a):
-    print(views.render_gantt(views.load(), views.term_width(), views.make_style(), a.hours, a.ahead, a.week))
+    print(views.render_gantt(views.load(), views.term_width(), views.make_style(), a.hours, a.ahead, a.week,
+                             a.provider))
 
 
-def cmd_week(_):
-    print(views.render_week(views.load(), views.term_width(), views.make_style()))
+def cmd_week(a):
+    print(views.render_week(views.load(), views.term_width(), views.make_style(), only=a.provider))
 
 
 def cmd_runs(a):
-    print(views.render_runs(views.load(), views.term_width(), views.make_style(), a.n))
+    print(views.render_runs(views.load(), views.term_width(), views.make_style(), a.n, a.provider))
 
 
 def cmd_add(a):
@@ -60,8 +68,11 @@ def cmd_add(a):
     folder = Path(a.dir or os.getcwd()).resolve()
     if not folder.is_dir():
         sys.exit(f"not a folder: {folder}")
-    t = core.add_task(prompt.strip(), folder, a.model or "", a.mode or "", a.tools or "", a.priority)
-    print(f"added #{t['id']} in {folder}")
+    try:
+        t = core.add_task(prompt.strip(), folder, a.model or "", a.mode or "", a.tools or "", a.priority, a.via)
+    except ValueError as e:
+        sys.exit(str(e))
+    print(f"added #{t['id']} in {folder} · runs on {t['via']}")
 
 
 def cmd_ls(a):
@@ -106,16 +117,14 @@ def cmd_top(a):
 
 
 def cmd_retry(a):
-    def fn(tasks, t):
-        t.update(status="queued", note="", session_id=None, runs=0)
-    edit_tasks(a.ids, fn, "requeued")
+    edit_tasks(a.ids, lambda tasks, t: core.reset_task(t), "requeued")
 
 
 def cmd_show(a):
     t = next((t for t in core.load_tasks() if t["id"] == a.id), None)
     if not t:
         sys.exit(f"#{a.id} not found")
-    print(f"#{t['id']} {t['status']} · runs {t['runs']} · {t['dir']}")
+    print(f"#{t['id']} {t['status']} · runs {t['runs']} · {core.route(t)} · {t['dir']}")
     for k in ("model", "permission_mode", "tools", "note", "session_id"):
         if t.get(k):
             print(f"{k}: {t[k]}")
@@ -187,6 +196,38 @@ def cmd_config(a):
     print(f"{a.key} = {cfg[a.key]}")
 
 
+def hv_invocation():
+    found = shutil.which("hv")
+    if found and Path(found).resolve().parent == HERE.resolve():
+        return "hv"
+    if FROZEN:
+        return f'"{sys.executable}"'
+    return f'py -3 "{HERE / "hv.py"}"'
+
+
+def cmd_skill(a):
+    unknown = set(a.agents) - set(SKILL_DIRS)
+    if unknown:
+        sys.exit(f"unknown agent: {', '.join(sorted(unknown))}; use claude or codex")
+    text = SKILL_SRC.read_text(encoding="utf-8")
+    inv = hv_invocation()
+    if inv != "hv":
+        text = re.sub(r"(?<![\w-])hv (?=(add|status)\b)", lambda _: inv + " ", text)
+    for agent in a.agents or core.enabled_providers(core.load_config()):
+        dest = SKILL_DIRS[agent]
+        dest.mkdir(parents=True, exist_ok=True)
+        body = text
+        if agent == "codex":
+            # Codex skills take only name and description; invocation policy lives in agents/openai.yaml.
+            body = re.sub(r"^(disable-model-invocation|argument-hint):.*\n", "", body, flags=re.M)
+            (dest / "agents").mkdir(exist_ok=True)
+            (dest / "agents" / "openai.yaml").write_text("policy:\n  allow_implicit_invocation: false\n",
+                                                        encoding="utf-8")
+        (dest / "SKILL.md").write_text(body, encoding="utf-8")
+        use = "/backlog" if agent == "claude" else "$backlog"
+        print(f"{core.PROVIDERS[agent].label}: {dest / 'SKILL.md'} · type {use} in a session")
+
+
 def cmd_snapshot(_):
     try:
         core.save_snapshot(json.load(sys.stdin))
@@ -195,7 +236,7 @@ def cmd_snapshot(_):
 
 
 def main():
-    p = argparse.ArgumentParser(prog="hv", description="Spend leftover Claude usage on a backlog.")
+    p = argparse.ArgumentParser(prog="hv", description="Spend leftover Claude Code and Codex usage on a backlog.")
     p.add_argument("--version", action="version", version=f"hv {core.VERSION}")
     sub = p.add_subparsers(dest="cmd")
     add = sub.add_parser("add", help="add a task")
@@ -205,7 +246,10 @@ def main():
     add.add_argument("-m", "--model")
     add.add_argument("-p", "--priority", type=int, default=0)
     add.add_argument("-t", "--tools", help='allowed tools, e.g. "Edit Bash(npm test:*)"')
-    add.add_argument("--mode", help="permission mode, e.g. acceptEdits")
+    add.add_argument("--mode", help="Claude permission mode, e.g. acceptEdits (Codex: plan = read-only, "
+                                    "bypassPermissions = no sandbox)")
+    add.add_argument("--via", choices=core.ROUTES, help="agent to run it: claude, codex or any (default: "
+                                                       "config default_route)")
     add.set_defaults(fn=cmd_add)
     ls = sub.add_parser("ls", help="list tasks")
     ls.add_argument("-a", "--all", action="store_true", help="include done")
@@ -218,21 +262,29 @@ def main():
     show = sub.add_parser("show", help="show a task and its result")
     show.add_argument("id", type=int)
     show.set_defaults(fn=cmd_show)
-    status = sub.add_parser("status", help="dashboard: usage, estimates, timeline, queue")
+    agent = argparse.ArgumentParser(add_help=False)
+    agent.add_argument("-p", "--provider", choices=list(core.PROVIDERS), help="one agent only")
+    status = sub.add_parser("status", parents=[agent], help="dashboard: usage, estimates, timeline, queue")
     status.add_argument("-s", "--short", action="store_true", help="one line")
     status.set_defaults(fn=cmd_status, short=False)
-    watch = sub.add_parser("watch", help="live dashboard")
+    watch = sub.add_parser("watch", parents=[agent], help="live dashboard")
     watch.add_argument("-n", "--interval", type=int, default=5, help="seconds between redraws")
     watch.set_defaults(fn=cmd_watch)
-    gantt = sub.add_parser("gantt", help="timeline of sessions, harvester modes and task runs")
+    gantt = sub.add_parser("gantt", parents=[agent], help="timeline of sessions, harvester modes and task runs")
     gantt.add_argument("-H", "--hours", type=float, default=24, help="hours back (default 24)")
     gantt.add_argument("-A", "--ahead", type=float, default=6, help="hours ahead (default 6)")
     gantt.add_argument("-w", "--week", action="store_true", help="whole weekly window")
     gantt.set_defaults(fn=cmd_gantt)
-    sub.add_parser("week", help="weekly usage chart with pace and projection").set_defaults(fn=cmd_week)
-    runs = sub.add_parser("runs", help="task run history")
+    sub.add_parser("week", parents=[agent], help="weekly usage chart with pace and projection").set_defaults(
+        fn=cmd_week)
+    runs = sub.add_parser("runs", parents=[agent], help="task run history")
     runs.add_argument("-n", type=int, default=20, help="how many (default 20)")
     runs.set_defaults(fn=cmd_runs)
+    skill = sub.add_parser("skill", help="install the /backlog skill for Claude Code and Codex")
+    skill.add_argument("action", choices=["install"])
+    skill.add_argument("agents", nargs="*", metavar="AGENT",
+                       help="claude, codex (default: every agent being harvested)")
+    skill.set_defaults(fn=cmd_skill)
     for name, fn, h in (("pause", cmd_pause, "stop harvesting"),
                         ("resume", cmd_resume, "resume harvesting"), ("now", cmd_now, "check usage now"),
                         ("app", cmd_app, "start the desktop app")):
@@ -247,7 +299,7 @@ def main():
     sub.add_parser("snapshot").set_defaults(fn=cmd_snapshot)
     a = p.parse_args()
     if not getattr(a, "fn", None):
-        a.fn, a.short = cmd_status, False
+        a.fn, a.short, a.provider = cmd_status, False, None
     a.fn(a)
 
 
