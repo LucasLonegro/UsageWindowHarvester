@@ -1,0 +1,51 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build
+        shell: pwsh
+        env:
+          VERSION: ${{ github.ref_type == 'tag' && github.ref_name || format('0.0.0-dev.{0}', github.run_number) }}
+        run: ./build.ps1 -Version $env:VERSION
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $out = & build\exe\hv.exe --version
+          if ($LASTEXITCODE -ne 0) { throw "hv.exe failed" }
+          Write-Host $out
+          $env:HV_HOME = "$env:RUNNER_TEMP\hv-home"
+          & build\exe\hv.exe status -s
+          if ($LASTEXITCODE -ne 0) { throw "hv.exe status failed" }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: UsageHarvester
+          path: dist/*.zip
+
+      - name: Publish release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zips = (Get-ChildItem dist\*.zip).FullName
+          $flags = @("--title", $env:GITHUB_REF_NAME, "--generate-notes")
+          if ($env:GITHUB_REF_NAME -match '-') { $flags += "--prerelease" }
+          gh release create $env:GITHUB_REF_NAME @zips @flags
