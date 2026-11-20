@@ -45,7 +45,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $zips = (Get-ChildItem dist\*.zip).FullName
+          # @() keeps one zip an array; splatting a string passes its characters.
+          $zips = @((Get-ChildItem dist\*.zip).FullName)
           $flags = @("--title", $env:GITHUB_REF_NAME, "--generate-notes")
           if ($env:GITHUB_REF_NAME -match '-') { $flags += "--prerelease" }
           gh release create $env:GITHUB_REF_NAME @zips @flags
+          if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
